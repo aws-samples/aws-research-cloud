@@ -1,0 +1,260 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: |
+  Budget-Safety-Switch.yaml: v1.0.0 -
+  Lambda function that iterates across all available regions and that stops
+  instances without a KeepRunning Tag set (to any value). **Note that instance-backed
+  ec2 instances will be terminated rather than stopped.**  It also sets Auto
+  Scaling Groups without a Keep Running Tag to zero desired instances.
+  This is designed to be deployed in the US-EAST-1 region, and to allow
+  Budgets to trigger the shutdown (via SNS publish) when a threshold is exceeded.
+
+Parameters:
+  DebugMode:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - LIVE
+    Default: DEBUG
+    Description: Run in Debug or Live mode (Live mode actually stops instances)
+
+
+Resources:
+
+  # Role to give Lambda permission to stop instances and zero ASGs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstance*
+              - ec2:DescribeRegions
+              - ec2:DescribeTags
+              - ec2:StopInstances
+              - autoscaling:Describe*
+              - autoscaling:SetDesiredCapacity
+              - autoscaling:UpdateAutoScalingGroup
+            Resource: "*"
+
+
+  # SNS Topic for notifications and actions
+  # Want this to trigger only on ALARM actions - shouldn't shut down instances
+  # when the Alarm moves to an OK state
+  BillingLambdaSNS:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: Billing Lambda
+      Subscription:
+        -
+          Endpoint: !GetAtt SafetySwitch.Arn
+          Protocol: lambda
+
+  # Create an SNS Policy that allows Budgets to publish a message to the Topic
+  BillingLambdaSNSPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowBudgets
+          Effect: Allow
+          Principal:
+            Service: budgets.amazonaws.com
+          Action: SNS:Publish
+          Resource: !Ref BillingLambdaSNS
+      Topics:
+        - !Ref BillingLambdaSNS
+
+  # Lambda function to stop instances and zero ASGs without an appropriate Tag
+  SafetySwitch:
+    Type: "AWS::Lambda::Function"
+    DependsOn:
+      - LambdaExecutionRole
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+
+          # Change to 0 to enable instances stopping
+          DEBUG = '${DebugMode}'
+
+          # Connect to EC2 service and get list of available regions
+          ec2client = boto3.client('ec2',region_name='${AWS::Region}')
+          response = ec2client.describe_regions()
+
+          # Iterate regions
+          regions = []
+          for region_info in response['Regions']:
+            regions.append(region_info['RegionName'])
+
+          # Create a filter for running instances
+          def handler(event, context):
+            filters = [
+            {
+              'Name': 'instance-state-name',
+              'Values': ['running']
+            }]
+
+            # Iterate regions
+            for region in regions:
+              print("Region: " + region)
+
+              # Connect to the AutoScaling API
+              asgclient = boto3.client('autoscaling',region_name=region)
+
+              # Describe all ASGs
+              asgresp = asgclient.describe_auto_scaling_groups()
+              asgs = []
+
+              # Track instances in an ASG
+              i_in_asg = []
+
+              # Loop ASGs
+              for asg in asgresp['AutoScalingGroups']:
+                asgmin = asg['MinSize']
+                asgdes = asg['DesiredCapacity']
+                asgmax = asg['MaxSize']
+                asgins = asg['Instances']
+
+                # Check for instances
+                if asgins:
+                  # Loop instances
+                  for ins in asgins:
+                    # Track instances
+                    i_in_asg.append(ins['InstanceId'])
+
+                # Define a tag filter
+                asgfilter = [
+                  {
+                    'Name':'auto-scaling-group',
+                    'Values': [asg['AutoScalingGroupName']]
+                  }
+                ]
+
+                # Get all ASG tags
+                asgtags = asgclient.describe_tags(Filters=asgfilter)
+
+                # Default the action to zero the ASG
+                zeroasg = 1
+
+                # Loop over all the tags
+                for tag in asgtags['Tags']:
+                  # If we find a tag called KeepRunning
+                  if tag['Key'].lower() == 'keeprunning':
+                    # Keep the ASG
+                    zeroasg = 0
+
+                # If ASG should be zeroed
+                if zeroasg == 1:
+                  # Check we're not running in debug mode
+                  if DEBUG == 'LIVE':
+                    print "Zeroing: " + asg['AutoScalingGroupName'] + " (from min/des/max): " + str(asgmin) + " / " + str(asgdes) + " / " + str(asgmax) + ")"
+                    resp = asgclient.update_auto_scaling_group(
+                      AutoScalingGroupName = asg['AutoScalingGroupName'],
+                      MinSize = 0,
+                      MaxSize = 0,
+                      DesiredCapacity = 0
+                    )
+                  else:
+                    print "Would have zeroed: " + asg['AutoScalingGroupName'] + " (from min/des/max): " + str(asgmin) + " / " + str(asgdes) + " / " + str(asgmax) + ")"
+                else:
+                  print "Keeping ASG: " + asg['AutoScalingGroupName'] + " (min/des/max): " + str(asgmin) + " / " + str(asgdes) + " / " + str(asgmax) + ")"
+
+              # Connect to the EC2 API
+              ec2 = boto3.resource('ec2',region_name=region)
+
+              # Get running instances
+              instances = ec2.instances.filter(Filters=filters)
+
+              # Iterate instances
+              for i in instances:
+                stopi = 1      # Assume we stop
+                iname = "empty-name-tag" # Set default  name
+                tags = i.tags  # Get list of tags
+
+                # Check for tags
+                if tags:
+                  # Look for KeepRunning tag
+                  for tag in tags:
+                    if tag['Key'].lower() == 'name':
+                      iname = tag['Value']
+
+                    if tag['Key'].lower() == 'keeprunning':
+                      stopi = 0
+
+                # stop instances with no tags
+                else:
+                  iname = "no-name-tag"
+                  stopi = 1
+
+                # Skip instances in ASGs
+                if i.id in i_in_asg:
+                  print "Skipping: " + i.id + " (" + iname + " - " + i.instance_type + " is in an ASG)"
+
+                # stop instances
+                elif stopi == 1:
+                  # Check we're not DEBUG
+                  if DEBUG == 'LIVE':
+                    if i.root_device_type == "instance-store":
+                      print "Killing: " + i.id + " (" + iname + " - " + i.instance_type + ")"
+                      i.terminate()
+                    else:
+                      print "Stopping: " + i.id + " (" + iname + " - " + i.instance_type + ")"
+                      i.stop()
+                  else:
+                    print "Would have stopped: " + i.id + " (" + iname + " - " + i.instance_type + ")"
+                else:
+                  print "Keeping: " + i.id + " (" + iname + " - " + i.instance_type + ")"
+
+      Description: Code to stop instances that don't have a "KeepRunning" Tag set
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python2.7
+      Timeout: 240
+
+  # Give SNS permissions to invoke Lambda
+  LambdaSNSPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SafetySwitch.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BillingLambdaSNS
+
+Outputs:
+  # Outputs the SNS ARN that can be used in the Budgets notification console
+  SNSARN:
+    Description: "Use this ARN in the Budgets SNS ARN field"
+    Value: !Ref BillingLambdaSNS
+  # Outputs the SNS ARN that can be used in the Budgets notification console
+  CloudWatchLogs:
+    Description: "Link to the CloudWatch Logs page for the Safety Switch"
+    Value: !Sub |
+      https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logStream:group=/aws/lambda/${SafetySwitch}
+  KeepRunning:
+    Description: "Use the following tag for instances and ASGs you want to keep running"
+    Value: "KeepRunning"
