@@ -1,0 +1,133 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: |
+  Budget-Safety-Switch-SAM.yaml: v1.0.0 -
+  Budget Safety Switch packaged as a SAM template.
+  Lambda function that iterates across all available regions and that stops
+  instances without a KeepRunning Tag set (to any value). **Note that instance-backed
+  ec2 instances will be terminated rather than stopped.**  It also sets Auto
+  Scaling Groups without a Keep Running Tag to zero desired instances.
+  This is designed to be deployed in the US-EAST-1 region, and to allow
+  Budgets to trigger the shutdown (via SNS publish) when a threshold is exceeded.
+Parameters:
+  DebugMode:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - LIVE
+    Default: DEBUG
+    Description: Run in Debug or Live mode (Live mode actually stops instances)
+  TagKey:
+    Type: String
+    Default: KeepRunning
+    Description: The tag key to look for to ensure that instances are kept running
+  TagValue:
+    Type: String
+    Default: True
+    Description: The tag value to look for to ensure that instances are kept running
+
+Resources:
+
+  BudgetSafetySwitch:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      CodeUri: ./index.py
+      Runtime: python2.7
+      Timeout: 240
+      Description: Code to stop instances that don't have the appropriate tag (defined in environment variables)
+      Environment:
+        Variables:
+          DebugMode: !Ref DebugMode
+          TagKey: !Ref TagKey
+          TagValue: !Ref TagValue
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  # Role to give Lambda permission to stop instances and zero ASGs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstance*
+              - ec2:DescribeRegions
+              - ec2:DescribeTags
+              - ec2:StopInstances
+              - ec2:TerminateInstances
+              - autoscaling:Describe*
+              - autoscaling:SetDesiredCapacity
+              - autoscaling:UpdateAutoScalingGroup
+            Resource: "*"
+
+
+  # SNS Topic for notifications and actions
+  # Want this to trigger only on ALARM actions - shouldn't shut down instances
+  # when the Alarm moves to an OK state
+  BillingLambdaSNS:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: Billing Lambda
+      Subscription:
+        -
+          Endpoint: !GetAtt BudgetSafetySwitch.Arn
+          Protocol: lambda
+
+  # Create an SNS Policy that allows Budgets to publish a message to the Topic
+  BillingLambdaSNSPolicy:
+    Type: "AWS::SNS::TopicPolicy"
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowBudgets
+          Effect: Allow
+          Principal:
+            Service: budgets.amazonaws.com
+          Action: SNS:Publish
+          Resource: !Ref BillingLambdaSNS
+      Topics:
+        - !Ref BillingLambdaSNS
+
+  # Give SNS permissions to invoke Lambda
+  LambdaSNSPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt BudgetSafetySwitch.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BillingLambdaSNS
+
+Outputs:
+  # Outputs the SNS ARN that can be used in the Budgets notification console
+  SNSARN:
+    Description: "Use this ARN in the Budgets SNS ARN field"
+    Value: !Ref BillingLambdaSNS
+  # Outputs the SNS ARN that can be used in the Budgets notification console
+  CloudWatchLogs:
+    Description: "Link to the CloudWatch Logs page for the Safety Switch"
+    Value: !Sub |
+      https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logStream:group=/aws/lambda/${BudgetSafetySwitch}
+  KeepRunning:
+    Description: "Use the following tag for instances and ASGs you want to keep running"
+    Value: "KeepRunning"

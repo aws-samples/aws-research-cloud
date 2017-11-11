@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Budget-Safety-Switch-SAM.yaml: v1.0.0 -
+
+  Budget Safety Switch packaged as a SAM template.
+
+  Lambda function that iterates across all available regions and that stops
+
+  instances without a KeepRunning Tag set (to any value). **Note that instance-backed
+
+  ec2 instances will be terminated rather than stopped.**  It also sets Auto
+
+  Scaling Groups without a Keep Running Tag to zero desired instances.
+
+  This is designed to be deployed in the US-EAST-1 region, and to allow
+
+  Budgets to trigger the shutdown (via SNS publish) when a threshold is exceeded.
+
+  '
+Outputs:
+  CloudWatchLogs:
+    Description: Link to the CloudWatch Logs page for the Safety Switch
+    Value:
+      Fn::Sub: 'https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logStream:group=/aws/lambda/${BudgetSafetySwitch}
+
+        '
+  KeepRunning:
+    Description: Use the following tag for instances and ASGs you want to keep running
+    Value: KeepRunning
+  SNSARN:
+    Description: Use this ARN in the Budgets SNS ARN field
+    Value:
+      Ref: BillingLambdaSNS
+Parameters:
+  DebugMode:
+    AllowedValues:
+    - DEBUG
+    - LIVE
+    Default: DEBUG
+    Description: Run in Debug or Live mode (Live mode actually stops instances)
+    Type: String
+  TagKey:
+    Default: KeepRunning
+    Description: The tag key to look for to ensure that instances are kept running
+    Type: String
+  TagValue:
+    Default: true
+    Description: The tag value to look for to ensure that instances are kept running
+    Type: String
+Resources:
+  BillingLambdaSNS:
+    Properties:
+      DisplayName: Billing Lambda
+      Subscription:
+      - Endpoint:
+          Fn::GetAtt:
+          - BudgetSafetySwitch
+          - Arn
+        Protocol: lambda
+    Type: AWS::SNS::Topic
+  BillingLambdaSNSPolicy:
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Statement:
+        - Action: SNS:Publish
+          Effect: Allow
+          Principal:
+            Service: budgets.amazonaws.com
+          Resource:
+            Ref: BillingLambdaSNS
+          Sid: AllowBudgets
+        Version: '2012-10-17'
+      Topics:
+      - Ref: BillingLambdaSNS
+    Type: AWS::SNS::TopicPolicy
+  BudgetSafetySwitch:
+    Properties:
+      CodeUri: s3://mhj-aws-sam-iad/633a75b2d393b209695a98b52ae5d545
+      Description: Code to stop instances that don't have the appropriate tag (defined
+        in environment variables)
+      Environment:
+        Variables:
+          DebugMode:
+            Ref: DebugMode
+          TagKey:
+            Ref: TagKey
+          TagValue:
+            Ref: TagValue
+      Handler: index.handler
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python2.7
+      Timeout: 240
+    Type: AWS::Serverless::Function
+  LambdaExecutionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - logs:*
+            Effect: Allow
+            Resource: arn:aws:logs:*:*:*
+          - Action:
+            - ec2:DescribeInstance*
+            - ec2:DescribeRegions
+            - ec2:DescribeTags
+            - ec2:StopInstances
+            - ec2:TerminateInstances
+            - autoscaling:Describe*
+            - autoscaling:SetDesiredCapacity
+            - autoscaling:UpdateAutoScalingGroup
+            Effect: Allow
+            Resource: '*'
+          Version: '2012-10-17'
+        PolicyName: root
+    Type: AWS::IAM::Role
+  LambdaSNSPermission:
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Fn::GetAtt:
+        - BudgetSafetySwitch
+        - Arn
+      Principal: sns.amazonaws.com
+      SourceArn:
+        Ref: BillingLambdaSNS
+    Type: AWS::Lambda::Permission
+Transform: AWS::Serverless-2016-10-31
